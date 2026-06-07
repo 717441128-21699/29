@@ -1,508 +1,458 @@
 import csv
 import json
 import os
-import sqlite3
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 from config import (
-    OUTPUT_DIR, MATERIAL_TYPES, COST_INCREASE_WARNING_RATE,
-    CONSECUTIVE_MONTHS_FOR_WARNING, COMPANY_NAME,
-    get_current_month_str, get_previous_month_str
+    OUTPUT_DIR, MATERIAL_CATALOG, COMPANY_INFO,
+    COST_WARNING_INCREASE_RATE, COST_WARNING_CONSECUTIVE_MONTHS,
+    current_month_str, now_str
 )
-from database import get_db_connection
-from logger import OperationLogger
-from inventory import NotificationManager
+from database import db_conn
+from logger import OperationLogger, LogModule, LogAction
+from inventory import NotificationService
 
 
-class CostWarningSystem:
-    SUGGESTIONS_POOL = [
-        "建议审查物料使用频率，考虑减少非必要印制",
-        "建议推动电子文档使用，减少纸质物料依赖",
-        "建议合并小批量订单，享受印刷商批量折扣",
-        "建议优化设计减少色彩和特殊工艺，降低单位成本",
-        "建议盘点现有库存，优先使用存量物料",
-        "建议评估是否有替代方案，如内部打印或数字化",
-        "建议与供应商谈判，争取更优惠的长期合作价格",
-        "建议建立部门物料领用审批机制，避免浪费"
+class CostWarningService:
+
+    SUGGESTIONS = [
+        "审查物料使用频率，考虑减少非必要印制",
+        "推动电子文档和数字化宣传，降低纸质依赖",
+        "合并小批量订单，以量议价获取印刷商折扣",
+        "优化设计稿，减少色彩层次和特殊工艺以降低成本",
+        "盘点现有库存，优先使用存量避免重复印制",
+        "评估内部打印能力，小额物料内部消化",
+        "与核心供应商签订年度框架协议，争取优惠价",
+        "建立部门物料领用登记制，杜绝浪费"
     ]
 
     @staticmethod
-    def analyze_monthly_cost_trends(month: Optional[str] = None) -> List[dict]:
-        """分析各部门连续月度费用增长情况"""
+    def analyze(month: Optional[str] = None) -> List[dict]:
         if not month:
-            month = get_current_month_str()
+            month = current_month_str()
 
-        months_to_check = [
-            get_previous_month_str(CONSECUTIVE_MONTHS_FOR_WARNING),
-            get_previous_month_str(1),
+        months = [
+            current_month_str(COST_WARNING_CONSECUTIVE_MONTHS),
+            current_month_str(1),
             month
         ]
-
         warnings = []
-        with get_db_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
 
-            cursor.execute("SELECT id, name FROM departments")
-            departments = [dict(r) for r in cursor.fetchall()]
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT dept_id, dept_name FROM departments")
+            depts = [dict(r) for r in c.fetchall()]
 
-            for dept in departments:
-                dept_costs = {}
-                for m in months_to_check:
-                    cursor.execute(
-                        "SELECT used_budget FROM department_budgets WHERE department_id = ? AND month = ?",
-                        (dept["id"], m)
+            for dept in depts:
+                costs = {}
+                for m in months:
+                    c.execute(
+                        "SELECT used FROM department_budgets WHERE dept_id = ? AND month = ?",
+                        (dept["dept_id"], m)
                     )
-                    row = cursor.fetchone()
-                    dept_costs[m] = row["used_budget"] if row else 0
+                    row = c.fetchone()
+                    costs[m] = row["used"] if row else 0.0
 
-                m0 = months_to_check[0]
-                m1 = months_to_check[1]
-                m2 = months_to_check[2]
-                c0, c1, c2 = dept_costs[m0], dept_costs[m1], dept_costs[m2]
-
+                c0, c1, c2 = costs[months[0]], costs[months[1]], costs[months[2]]
                 if c0 > 0 and c1 > 0:
-                    rate1 = (c1 - c0) / c0
-                    rate2 = (c2 - c1) / c1 if c1 > 0 else 0
+                    r1 = (c1 - c0) / c0
+                    r2 = (c2 - c1) / c1 if c1 > 0 else 0.0
 
-                    if (rate1 > COST_INCREASE_WARNING_RATE and
-                            rate2 > COST_INCREASE_WARNING_RATE):
-                        avg_rate = (rate1 + rate2) / 2
-                        suggestions = CostWarningSystem.SUGGESTIONS_POOL[:3]
+                    if r1 > COST_WARNING_INCREASE_RATE and r2 > COST_WARNING_INCREASE_RATE:
+                        avg_rate = (r1 + r2) / 2
+                        sgs = CostWarningService.SUGGESTIONS[:3]
+                        level = "critical" if avg_rate > 0.5 else "warning"
 
-                        warning_level = "critical" if avg_rate > 0.5 else "warning"
-
-                        cursor.execute(
+                        c.execute(
                             """INSERT OR IGNORE INTO cost_warnings
-                               (department_id, month, increase_rate, warning_level, suggestions)
+                               (dept_id, month, increase_rate, warn_level, suggestions)
                                VALUES (?, ?, ?, ?, ?)""",
-                            (dept["id"], month, round(avg_rate, 4),
-                             warning_level, json.dumps(suggestions, ensure_ascii=False))
+                            (dept["dept_id"], month, round(avg_rate, 4),
+                             level, json.dumps(sgs, ensure_ascii=False))
                         )
 
-                        warning_data = {
-                            "department_id": dept["id"],
-                            "department_name": dept["name"],
+                        w = {
+                            "dept_id": dept["dept_id"],
+                            "dept_name": dept["dept_name"],
                             "month": month,
-                            f"cost_{m0}": c0,
-                            f"cost_{m1}": c1,
-                            f"cost_{m2}": c2,
-                            "increase_rate_1": round(rate1, 4),
-                            "increase_rate_2": round(rate2, 4),
-                            "avg_increase_rate": round(avg_rate, 4),
-                            "warning_level": warning_level,
-                            "suggestions": suggestions
+                            "avg_rate": round(avg_rate, 4),
+                            "rate_1": round(r1, 4),
+                            "rate_2": round(r2, 4),
+                            f"cost_{months[0]}": c0,
+                            f"cost_{months[1]}": c1,
+                            f"cost_{months[2]}": c2,
+                            "warn_level": level,
+                            "suggestions": sgs
                         }
-                        warnings.append(warning_data)
+                        warnings.append(w)
 
-                        cursor.execute(
-                            "SELECT supervisor_id, director_id FROM departments WHERE id = ?",
-                            (dept["id"],)
+                        c.execute(
+                            "SELECT supervisor_id, director_id FROM departments WHERE dept_id = ?",
+                            (dept["dept_id"],)
                         )
-                        approvers = cursor.fetchone()
-                        if approvers:
-                            for approver_id in [approvers["supervisor_id"], approvers["director_id"]]:
-                                if approver_id:
-                                    NotificationManager.send(
-                                        recipient_id=approver_id,
-                                        notification_type=NotificationManager.TYPE_BUDGET_WARNING,
-                                        title=f"【费用预警】{dept['name']}连续两月费用增长超20%",
+                        heads = c.fetchone()
+                        if heads:
+                            for aid in [heads["supervisor_id"], heads["director_id"]]:
+                                if aid:
+                                    NotificationService.send(
+                                        recipient_id=aid,
+                                        notif_type=NotificationService.TYPE_BUDGET_WARNING,
+                                        title=f"【费用预警】{dept['dept_name']}连续两月费用增长超20%",
                                         content=(
-                                            f"部门: {dept['name']}\n"
-                                            f"{m0}费用: {c0:.2f}元\n"
-                                            f"{m1}费用: {c1:.2f}元 (增长{rate1*100:.1f}%)\n"
-                                            f"{m2}费用: {c2:.2f}元 (增长{rate2*100:.1f}%)\n"
-                                            f"平均增长率: {avg_rate*100:.1f}%\n\n"
-                                            f"节约建议:\n" +
-                                            "\n".join([f"  - {s}" for s in suggestions])
+                                            f"部门: {dept['dept_name']}\n"
+                                            f"{months[0]}: ¥{c0:,.2f}\n"
+                                            f"{months[1]}: ¥{c1:,.2f} (环比+{r1*100:.1f}%)\n"
+                                            f"{months[2]}: ¥{c2:,.2f} (环比+{r2*100:.1f}%)\n"
+                                            f"平均增长率: +{avg_rate*100:.1f}%\n\n"
+                                            "节约建议:\n" +
+                                            "\n".join(f"  • {s}" for s in sgs)
                                         ),
-                                        related_id=dept["id"],
+                                        related_id=dept["dept_id"],
                                         related_type="department"
                                     )
-
         return warnings
 
 
-class MonthlyReportGenerator:
+class ReportService:
+
     @staticmethod
-    def _get_monthly_data(month: str) -> Dict[str, Any]:
-        with get_db_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+    def _collect(month: str) -> Dict[str, Any]:
+        with db_conn() as conn:
+            c = conn.cursor()
 
-            cursor.execute(
-                """SELECT SUM(po.total_amount) as total_cost, COUNT(*) as total_orders
-                   FROM print_orders po
-                   WHERE strftime('%Y-%m', po.created_at) = ?
-                   AND po.status != 'cancelled'""",
+            c.execute(
+                """SELECT SUM(o.total_amount) AS cost, COUNT(*) AS orders
+                   FROM print_orders o
+                   WHERE strftime('%Y-%m', o.created_at) = ?
+                     AND o.status != 'cancelled'""",
                 (month,)
             )
-            totals = dict(cursor.fetchone() or {})
+            t = dict(c.fetchone() or {})
+            total_cost = t["cost"] or 0.0
+            total_orders = t["orders"] or 0
 
-            cursor.execute(
-                """SELECT d.id as department_id, d.name as department_name,
-                           SUM(po.total_amount) as total_cost,
-                           COUNT(*) as order_count,
-                           SUM(po.quantity) as total_quantity
-                   FROM print_orders po
-                   LEFT JOIN print_requests pr ON po.request_id = pr.id
-                   LEFT JOIN departments d ON pr.department_id = d.id
-                   WHERE strftime('%Y-%m', po.created_at) = ?
-                   AND po.status != 'cancelled'
-                   GROUP BY d.id, d.name
-                   ORDER BY total_cost DESC""",
+            c.execute(
+                """SELECT d.dept_id, d.dept_name,
+                           SUM(o.total_amount) AS cost,
+                           COUNT(*) AS orders,
+                           SUM(o.quantity) AS qty
+                   FROM print_orders o
+                   LEFT JOIN print_requests r ON o.req_id = r.req_id
+                   LEFT JOIN departments d ON r.dept_id = d.dept_id
+                   WHERE strftime('%Y-%m', o.created_at) = ?
+                     AND o.status != 'cancelled'
+                   GROUP BY d.dept_id, d.dept_name
+                   ORDER BY cost DESC""",
                 (month,)
             )
-            by_department = [dict(r) for r in cursor.fetchall()]
+            by_dept = []
+            for r in c.fetchall():
+                row = dict(r)
+                row["avg_per_order"] = (
+                    round(row["cost"] / row["orders"], 2) if row["orders"] else 0.0
+                )
+                by_dept.append(row)
 
-            for dept in by_department:
-                if dept["order_count"] and dept["order_count"] > 0:
-                    dept["avg_cost_per_order"] = round(dept["total_cost"] / dept["order_count"], 2)
-                else:
-                    dept["avg_cost_per_order"] = 0
-
-            cursor.execute(
-                """SELECT po.material_type,
-                           SUM(po.total_amount) as total_cost,
-                           COUNT(*) as order_count,
-                           SUM(po.quantity) as total_quantity
-                   FROM print_orders po
-                   WHERE strftime('%Y-%m', po.created_at) = ?
-                   AND po.status != 'cancelled'
-                   GROUP BY po.material_type
-                   ORDER BY total_cost DESC""",
+            c.execute(
+                """SELECT o.material_type,
+                           SUM(o.total_amount) AS cost,
+                           COUNT(*) AS orders,
+                           SUM(o.quantity) AS qty
+                   FROM print_orders o
+                   WHERE strftime('%Y-%m', o.created_at) = ?
+                     AND o.status != 'cancelled'
+                   GROUP BY o.material_type
+                   ORDER BY cost DESC""",
                 (month,)
             )
-            by_material = [dict(r) for r in cursor.fetchall()]
+            by_mat = []
+            for r in c.fetchall():
+                row = dict(r)
+                info = MATERIAL_CATALOG.get(row["material_type"], {})
+                row["name_cn"] = info.get("name_cn", row["material_type"])
+                row["unit"] = info.get("unit", "")
+                row["avg_unit_cost"] = (
+                    round(row["cost"] / row["qty"], 2) if row["qty"] else 0.0
+                )
+                by_mat.append(row)
 
-            for mat in by_material:
-                mat_info = MATERIAL_TYPES.get(mat["material_type"], {})
-                mat["material_name"] = mat_info.get("name", mat["material_type"])
-                mat["unit"] = mat_info.get("unit", "")
-                if mat["total_quantity"] and mat["total_quantity"] > 0:
-                    mat["avg_unit_cost"] = round(mat["total_cost"] / mat["total_quantity"], 2)
-                else:
-                    mat["avg_unit_cost"] = 0
-
-            cursor.execute(
-                """SELECT e.id as employee_id, e.name as employee_name,
-                           d.name as department_name,
-                           SUM(po.total_amount) as total_cost,
-                           COUNT(*) as order_count
-                   FROM print_orders po
-                   LEFT JOIN print_requests pr ON po.request_id = pr.id
-                   LEFT JOIN employees e ON pr.employee_id = e.id
-                   LEFT JOIN departments d ON pr.department_id = d.id
-                   WHERE strftime('%Y-%m', po.created_at) = ?
-                   AND po.status != 'cancelled'
-                   GROUP BY e.id, e.name
-                   ORDER BY total_cost DESC
+            c.execute(
+                """SELECT e.emp_id, e.emp_name, d.dept_name,
+                           SUM(o.total_amount) AS cost,
+                           COUNT(*) AS orders
+                   FROM print_orders o
+                   LEFT JOIN print_requests r ON o.req_id = r.req_id
+                   LEFT JOIN employees e ON r.emp_id = e.emp_id
+                   LEFT JOIN departments d ON r.dept_id = d.dept_id
+                   WHERE strftime('%Y-%m', o.created_at) = ?
+                     AND o.status != 'cancelled'
+                   GROUP BY e.emp_id, e.emp_name
+                   ORDER BY cost DESC
                    LIMIT 10""",
                 (month,)
             )
-            top_employees = [dict(r) for r in cursor.fetchall()]
+            top_emp = [dict(r) for r in c.fetchall()]
 
-            prev_month = get_previous_month_str(1)
-            cursor.execute(
-                """SELECT SUM(po.total_amount) as prev_total_cost
-                   FROM print_orders po
-                   WHERE strftime('%Y-%m', po.created_at) = ?
-                   AND po.status != 'cancelled'""",
+            prev_month = current_month_str(1)
+            c.execute(
+                """SELECT SUM(o.total_amount) AS cost
+                   FROM print_orders o
+                   WHERE strftime('%Y-%m', o.created_at) = ?
+                     AND o.status != 'cancelled'""",
                 (prev_month,)
             )
-            prev_row = cursor.fetchone()
-            prev_total = prev_row["prev_total_cost"] if prev_row else 0
-            current_total = totals.get("total_cost") or 0
-
-            if prev_total > 0:
-                yoy_change = (current_total - prev_total) / prev_total
+            pr = c.fetchone()
+            prev_cost = pr["cost"] if pr else 0.0
+            if prev_cost > 0:
+                yoy = (total_cost - prev_cost) / prev_cost
             else:
-                yoy_change = 0 if current_total == 0 else 1.0
+                yoy = 0.0 if total_cost == 0 else 1.0
 
-            cursor.execute(
-                """SELECT strftime('%Y-%m', po.created_at) as m,
-                           SUM(po.total_amount) as cost
-                   FROM print_orders po
-                   WHERE po.created_at >= date('now', '-12 months')
-                   AND po.status != 'cancelled'
-                   GROUP BY strftime('%Y-%m', po.created_at)
+            c.execute(
+                """SELECT strftime('%Y-%m', o.created_at) AS m,
+                           SUM(o.total_amount) AS cost
+                   FROM print_orders o
+                   WHERE o.created_at >= date('now', '-12 months')
+                     AND o.status != 'cancelled'
+                   GROUP BY strftime('%Y-%m', o.created_at)
                    ORDER BY m"""
             )
-            last_12_months = [dict(r) for r in cursor.fetchall()]
+            trend = [dict(r) for r in c.fetchall()]
+
+            warnings = CostWarningService.analyze(month)
 
             return {
                 "month": month,
-                "company_name": COMPANY_NAME,
-                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "total_cost": current_total,
-                "total_orders": totals.get("total_orders") or 0,
+                "company": COMPANY_INFO["name"],
+                "generated_at": now_str(),
+                "total_cost": round(total_cost, 2),
+                "total_orders": total_orders,
                 "prev_month": prev_month,
-                "prev_total_cost": prev_total,
-                "yoy_change_rate": round(yoy_change, 4),
-                "by_department": by_department,
-                "by_material": by_material,
-                "top_employees": top_employees,
-                "last_12_months": last_12_months
+                "prev_cost": round(prev_cost, 2),
+                "yoy_rate": round(yoy, 4),
+                "by_department": by_dept,
+                "by_material": by_mat,
+                "top_employees": top_emp,
+                "trend_12m": trend,
+                "warnings": warnings,
+                "warning_count": len(warnings)
             }
 
     @staticmethod
-    def _generate_text_chart(data: List[dict], value_key: str, label_key: str,
-                             title: str, max_width: int = 40) -> str:
+    def _bar_chart(data: list, value_key: str, label_key: str,
+                   title: str, width: int = 36) -> str:
         if not data:
-            return f"{title}\n  (无数据)\n"
-
-        lines = [f"\n{title}", "-" * (max_width + 20)]
-        max_val = max((d.get(value_key) or 0) for d in data) or 1
-
+            return f"\n{title}\n  (无数据)\n"
+        lines = [f"\n{title}", "-" * (width + 24)]
+        mx = max((d.get(value_key) or 0) for d in data) or 1
         for d in data:
-            val = d.get(value_key) or 0
-            label = str(d.get(label_key, ""))[:15]
-            bar_len = int((val / max_val) * max_width)
-            bar = "█" * bar_len
-            lines.append(f"  {label:<15} | {bar:<{max_width}} {val:>10,.2f}")
+            v = d.get(value_key) or 0
+            label = str(d.get(label_key, ""))[:14]
+            bar = "█" * int((v / mx) * width)
+            lines.append(f"  {label:<14} | {bar:<{width}} ¥{v:>12,.2f}")
         lines.append("")
         return "\n".join(lines)
 
     @staticmethod
-    def generate_report(month: Optional[str] = None,
-                        auto_export: bool = True) -> Dict[str, Any]:
+    def generate(month: Optional[str] = None, export: bool = True) -> Dict[str, Any]:
         if not month:
-            month = get_current_month_str()
-
-        data = MonthlyReportGenerator._get_monthly_data(month)
-        warnings = CostWarningSystem.analyze_monthly_cost_trends(month)
-
-        report_data = {
-            **data,
-            "cost_warnings": warnings,
-            "warning_count": len(warnings)
-        }
-
+            month = current_month_str()
+        data = ReportService._collect(month)
         pdf_path = None
         excel_path = None
+        if export:
+            pdf_path = ReportService.export_pdf(data)
+            excel_path = ReportService.export_excel(data)
 
-        if auto_export:
-            pdf_path = MonthlyReportGenerator.export_to_pdf(report_data)
-            excel_path = MonthlyReportGenerator.export_to_csv(report_data)
-
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
                 """INSERT OR REPLACE INTO monthly_reports
                    (month, total_cost, total_orders, report_data, pdf_path, excel_path, generated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (month, data["total_cost"], data["total_orders"],
-                 json.dumps(report_data, ensure_ascii=False), pdf_path, excel_path)
+                 json.dumps(data, ensure_ascii=False), pdf_path, excel_path, now_str())
             )
 
-        OperationLogger.log(
+        OperationLogger.record(
             operator_id=None,
             operator_name="系统",
-            action=OperationLogger.ACTION_GENERATE,
-            module=OperationLogger.MODULE_REPORT,
+            action=LogAction.GENERATE,
+            module=LogModule.REPORT,
             details={
                 "month": month,
                 "total_cost": data["total_cost"],
                 "total_orders": data["total_orders"],
-                "warning_count": len(warnings),
+                "warning_count": data["warning_count"],
                 "pdf_path": pdf_path,
                 "excel_path": excel_path
             }
         )
-
-        report_data["pdf_path"] = pdf_path
-        report_data["excel_path"] = excel_path
-        return report_data
+        data["pdf_path"] = pdf_path
+        data["excel_path"] = excel_path
+        return data
 
     @staticmethod
-    def export_to_pdf(data: Dict[str, Any]) -> str:
-        """使用文本格式生成PDF报告（不依赖第三方PDF库）"""
+    def export_pdf(data: Dict[str, Any]) -> str:
         month = data["month"]
-        filename = f"印刷费用分析报告_{month}.txt"
-        filepath = os.path.join(OUTPUT_DIR, filename)
+        filepath = os.path.join(OUTPUT_DIR, f"印刷费用分析报告_{month}.txt")
+        D = data
+        L = "=" * 72
+        S = "-" * 72
+        yoy = D["yoy_rate"] * 100
+        yoy_sign = "+" if yoy >= 0 else ""
 
-        lines = []
-        lines.append("=" * 70)
-        lines.append(f"  {data['company_name']} - 印刷费用月度分析报告")
-        lines.append("=" * 70)
-        lines.append(f"  报告月份: {month}")
-        lines.append(f"  生成时间: {data['generated_at']}")
+        lines = [
+            L,
+            f"  {D['company']} - 印刷费用月度分析报告",
+            L,
+            f"  报告月份: {month}",
+            f"  生成时间: {D['generated_at']}",
+            "",
+            S,
+            "一、总体费用概览",
+            S,
+            f"  本月总费用:       ¥{D['total_cost']:>14,.2f}",
+            f"  本月订单总数:     {D['total_orders']:>14}",
+            f"  上月总费用:       ¥{D['prev_cost']:>14,.2f}",
+            f"  环比变化率:       {yoy_sign}{yoy:>12.2f}%",
+            "",
+            ReportService._bar_chart(
+                D["trend_12m"], "cost", "m",
+                "二、近12个月费用趋势图",
+                width=40
+            ),
+            S,
+            "三、按部门统计",
+            S,
+        ]
+        if D["by_department"]:
+            lines.append(f"  {'部门':<14} {'费用(¥)':>14} {'订单数':>8} {'平均单费(¥)':>14}")
+            lines.append("  " + "-" * 54)
+            for d in D["by_department"]:
+                lines.append(
+                    f"  {(d['dept_name'] or '未知'):<14} "
+                    f"{d['cost']:>14,.2f} {d['orders']:>8} {d['avg_per_order']:>14,.2f}"
+                )
+        else:
+            lines.append("  (本月无数据)")
         lines.append("")
-
-        lines.append("-" * 70)
-        lines.append("一、总体费用概览")
-        lines.append("-" * 70)
-        lines.append(f"  总费用:       ¥{data['total_cost']:,.2f}")
-        lines.append(f"  订单总数:     {data['total_orders']}")
-        lines.append(f"  上月费用:     ¥{data['prev_total_cost']:,.2f}")
-        change_pct = data['yoy_change_rate'] * 100
-        change_sign = "+" if change_pct >= 0 else ""
-        lines.append(f"  环比变化:     {change_sign}{change_pct:.1f}%")
-        lines.append("")
-
-        lines.append(MonthlyReportGenerator._generate_text_chart(
-            data["last_12_months"], "cost", "m",
-            "近12个月费用趋势 (单位: 元)", max_width=40
+        lines.append(ReportService._bar_chart(
+            D["by_department"], "cost", "dept_name",
+            "部门费用分布", width=34
         ))
-
-        lines.append("-" * 70)
-        lines.append("二、按部门统计")
-        lines.append("-" * 70)
-        if data["by_department"]:
-            lines.append(f"  {'部门':<12} {'费用(元)':>12} {'订单数':>8} {'平均单费(元)':>12}")
-            lines.append("  " + "-" * 46)
-            for dept in data["by_department"]:
+        lines.extend([
+            S,
+            "四、按物料类型统计",
+            S,
+        ])
+        if D["by_material"]:
+            lines.append(f"  {'物料类型':<12} {'费用(¥)':>14} {'数量':>10} {'平均单价(¥)':>14}")
+            lines.append("  " + "-" * 54)
+            for m in D["by_material"]:
                 lines.append(
-                    f"  {dept['department_name'] or '未知':<12} "
-                    f"{dept['total_cost']:>12,.2f} "
-                    f"{dept['order_count']:>8} "
-                    f"{dept['avg_cost_per_order']:>12,.2f}"
+                    f"  {m['name_cn']:<12} "
+                    f"{m['cost']:>14,.2f} {m['qty']:>6}{m['unit']:<4} {m['avg_unit_cost']:>14,.2f}"
                 )
         else:
-            lines.append("  (无数据)")
+            lines.append("  (本月无数据)")
         lines.append("")
-
-        lines.append(MonthlyReportGenerator._generate_text_chart(
-            data["by_department"], "total_cost", "department_name",
-            "各部门费用分布图 (单位: 元)", max_width=35
-        ))
-
-        lines.append("-" * 70)
-        lines.append("三、按物料类型统计")
-        lines.append("-" * 70)
-        if data["by_material"]:
-            lines.append(f"  {'物料类型':<12} {'费用(元)':>12} {'数量':>8} {'平均单价(元)':>12}")
-            lines.append("  " + "-" * 46)
-            for mat in data["by_material"]:
+        lines.extend([
+            S,
+            f"五、费用 TOP10 员工",
+            S,
+        ])
+        if D["top_employees"]:
+            lines.append(f"  {'#':<3} {'姓名':<10} {'部门':<14} {'费用(¥)':>14} {'订单数':>8}")
+            lines.append("  " + "-" * 54)
+            for i, e in enumerate(D["top_employees"], 1):
                 lines.append(
-                    f"  {mat['material_name']:<12} "
-                    f"{mat['total_cost']:>12,.2f} "
-                    f"{mat['total_quantity']:>8} "
-                    f"{mat['avg_unit_cost']:>12,.2f}"
+                    f"  {i:<3} {(e['emp_name'] or '未知'):<10} "
+                    f"{(e['dept_name'] or '-'):<14} {e['cost']:>14,.2f} {e['orders']:>8}"
                 )
         else:
-            lines.append("  (无数据)")
+            lines.append("  (本月无数据)")
         lines.append("")
-
-        lines.append("-" * 70)
-        lines.append("四、费用 TOP10 员工")
-        lines.append("-" * 70)
-        if data["top_employees"]:
-            lines.append(f"  {'排名':<4} {'姓名':<10} {'部门':<12} {'费用(元)':>12} {'订单数':>8}")
-            lines.append("  " + "-" * 50)
-            for i, emp in enumerate(data["top_employees"], 1):
-                lines.append(
-                    f"  {i:<4} {emp['employee_name'] or '未知':<10} "
-                    f"{emp['department_name'] or '-':<12} "
-                    f"{emp['total_cost']:>12,.2f} "
-                    f"{emp['order_count']:>8}"
-                )
-        else:
-            lines.append("  (无数据)")
-        lines.append("")
-
-        lines.append("-" * 70)
-        lines.append(f"五、费用预警 ({data['warning_count']}个部门触发预警)")
-        lines.append("-" * 70)
-        if data["cost_warnings"]:
-            for w in data["cost_warnings"]:
-                level = "【严重】" if w["warning_level"] == "critical" else "【警告】"
-                lines.append(f"  {level} {w['department_name']}")
-                lines.append(f"    平均增长率: {w['avg_increase_rate'] * 100:.1f}%")
+        lines.extend([
+            S,
+            f"六、费用预警 ({D['warning_count']}个部门触发)",
+            S,
+        ])
+        if D["warnings"]:
+            for w in D["warnings"]:
+                tag = "【严重】" if w["warn_level"] == "critical" else "【警告】"
+                lines.append(f"  {tag} {w['dept_name']}")
+                lines.append(f"    平均月增长率: +{w['avg_rate'] * 100:.1f}%")
                 lines.append(f"    节约建议:")
                 for s in w["suggestions"]:
                     lines.append(f"      • {s}")
                 lines.append("")
         else:
-            lines.append("  本月无部门触发费用预警，所有部门费用控制良好。")
+            lines.append("  本月无部门触发费用预警，各部门费用控制良好。")
         lines.append("")
-
-        lines.append("=" * 70)
-        lines.append("  报告结束 - 本报告由印刷管理系统自动生成")
-        lines.append("=" * 70)
-
+        lines.extend([
+            L,
+            "  本报告由印刷自动化管理系统自动生成",
+            L,
+            ""
+        ])
         with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-
         return filepath
 
     @staticmethod
-    def export_to_csv(data: Dict[str, Any]) -> str:
-        """导出Excel兼容的CSV格式报告（多个sheet逻辑通过多文件实现）"""
+    def export_excel(data: Dict[str, Any]) -> str:
         month = data["month"]
-        dir_path = os.path.join(OUTPUT_DIR, f"印刷费用报告_{month}_CSV")
-        os.makedirs(dir_path, exist_ok=True)
+        out_dir = os.path.join(OUTPUT_DIR, f"印刷费用报告_{month}_CSV")
+        os.makedirs(out_dir, exist_ok=True)
 
-        summary_path = os.path.join(dir_path, "1_总体概览.csv")
-        with open(summary_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["指标", "数值"])
-            writer.writerow(["报告月份", month])
-            writer.writerow(["总费用(元)", data["total_cost"]])
-            writer.writerow(["订单总数", data["total_orders"]])
-            writer.writerow(["上月费用(元)", data["prev_total_cost"]])
-            writer.writerow(["环比变化率", f"{data['yoy_change_rate'] * 100:.2f}%"])
-            writer.writerow(["预警部门数", data["warning_count"]])
+        def _w(fn, headers, rows):
+            path = os.path.join(out_dir, fn)
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(headers)
+                for row in rows:
+                    w.writerow(row)
 
-        dept_path = os.path.join(dir_path, "2_部门统计.csv")
-        with open(dept_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["部门", "总费用(元)", "订单数", "数量", "平均单费(元)"])
-            for dept in data["by_department"]:
-                writer.writerow([
-                    dept.get("department_name", "未知"),
-                    dept.get("total_cost", 0),
-                    dept.get("order_count", 0),
-                    dept.get("total_quantity", 0),
-                    dept.get("avg_cost_per_order", 0)
-                ])
+        _w("1_总体概览.csv",
+           ["指标", "数值"],
+           [
+               ["报告月份", month],
+               ["本月总费用(¥)", data["total_cost"]],
+               ["本月订单总数", data["total_orders"]],
+               ["上月总费用(¥)", data["prev_cost"]],
+               ["环比变化率(%)", f"{data['yoy_rate'] * 100:.2f}"],
+               ["预警部门数", data["warning_count"]],
+           ])
 
-        mat_path = os.path.join(dir_path, "3_物料统计.csv")
-        with open(mat_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["物料类型", "单位", "总费用(元)", "订单数", "数量", "平均单价(元)"])
-            for mat in data["by_material"]:
-                writer.writerow([
-                    mat.get("material_name", mat.get("material_type", "")),
-                    mat.get("unit", ""),
-                    mat.get("total_cost", 0),
-                    mat.get("order_count", 0),
-                    mat.get("total_quantity", 0),
-                    mat.get("avg_unit_cost", 0)
-                ])
+        _w("2_部门统计.csv",
+           ["部门", "总费用(¥)", "订单数", "数量", "平均单费(¥)"],
+           [[d.get("dept_name", "未知"), d.get("cost", 0), d.get("orders", 0),
+             d.get("qty", 0), d.get("avg_per_order", 0)]
+            for d in data["by_department"]])
 
-        emp_path = os.path.join(dir_path, "4_员工TOP10.csv")
-        with open(emp_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["排名", "姓名", "部门", "总费用(元)", "订单数"])
-            for i, emp in enumerate(data["top_employees"], 1):
-                writer.writerow([
-                    i,
-                    emp.get("employee_name", "未知"),
-                    emp.get("department_name", ""),
-                    emp.get("total_cost", 0),
-                    emp.get("order_count", 0)
-                ])
+        _w("3_物料统计.csv",
+           ["物料类型", "单位", "总费用(¥)", "订单数", "数量", "平均单价(¥)"],
+           [[m.get("name_cn", ""), m.get("unit", ""), m.get("cost", 0),
+             m.get("orders", 0), m.get("qty", 0), m.get("avg_unit_cost", 0)]
+            for m in data["by_material"]])
 
-        trend_path = os.path.join(dir_path, "5_近12月趋势.csv")
-        with open(trend_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["月份", "总费用(元)"])
-            for m in data["last_12_months"]:
-                writer.writerow([m.get("m", ""), m.get("cost", 0)])
+        _w("4_员工TOP10.csv",
+           ["排名", "姓名", "部门", "总费用(¥)", "订单数"],
+           [[i + 1, e.get("emp_name", ""), e.get("dept_name", ""),
+             e.get("cost", 0), e.get("orders", 0)]
+            for i, e in enumerate(data["top_employees"])])
 
-        warn_path = os.path.join(dir_path, "6_费用预警.csv")
-        with open(warn_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["部门", "预警级别", "平均增长率", "节约建议"])
-            for w in data["cost_warnings"]:
-                writer.writerow([
-                    w.get("department_name", ""),
-                    "严重" if w.get("warning_level") == "critical" else "警告",
-                    f"{w.get('avg_increase_rate', 0) * 100:.2f}%",
-                    "；".join(w.get("suggestions", []))
-                ])
+        _w("5_近12月趋势.csv",
+           ["月份", "总费用(¥)"],
+           [[t.get("m", ""), t.get("cost", 0)] for t in data["trend_12m"]])
 
-        index_path = os.path.join(OUTPUT_DIR, f"印刷费用报告_{month}_CSV.zip")
-        return dir_path
+        _w("6_费用预警.csv",
+           ["部门", "级别", "平均增长率(%)", "节约建议"],
+           [[w.get("dept_name", ""),
+             "严重" if w.get("warn_level") == "critical" else "警告",
+             f"{w.get('avg_rate', 0) * 100:.2f}",
+             "；".join(w.get("suggestions", []))]
+            for w in data["warnings"]])
+
+        return out_dir

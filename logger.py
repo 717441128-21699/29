@@ -1,37 +1,45 @@
 import csv
 import json
-import sqlite3
-from datetime import datetime
+import os
 from typing import Optional
 
-from database import get_db_connection
+from database import db_conn
+from config import LOG_DIR, now_str
+
+
+class LogModule:
+    PRINT_REQUEST = "print_request"
+    APPROVAL = "approval"
+    PRINT_ORDER = "print_order"
+    INVENTORY = "inventory"
+    BUDGET = "budget"
+    REPORT = "report"
+    BATCH = "batch_print"
+    SYSTEM = "system"
+
+
+class LogAction:
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE = "delete"
+    SUBMIT = "submit"
+    VALIDATE = "validate"
+    APPROVE = "approve"
+    REJECT = "reject"
+    PICKUP = "pickup"
+    REMIND = "remind"
+    GENERATE = "generate"
+    EXPORT = "export"
+    MERGE = "merge"
+    WARN = "warn"
+    DELIVER = "deliver"
+    COMPLETE = "complete"
 
 
 class OperationLogger:
-    MODULE_REQUEST = "print_request"
-    MODULE_APPROVAL = "approval"
-    MODULE_ORDER = "print_order"
-    MODULE_INVENTORY = "inventory"
-    MODULE_BUDGET = "budget"
-    MODULE_REPORT = "report"
-    MODULE_SYSTEM = "system"
-
-    ACTION_CREATE = "create"
-    ACTION_UPDATE = "update"
-    ACTION_DELETE = "delete"
-    ACTION_APPROVE = "approve"
-    ACTION_REJECT = "reject"
-    ACTION_SUBMIT = "submit"
-    ACTION_VALIDATE = "validate"
-    ACTION_PICKUP = "pickup"
-    ACTION_REMIND = "remind"
-    ACTION_GENERATE = "generate"
-    ACTION_EXPORT = "export"
-    ACTION_MERGE = "merge"
-    ACTION_WARN = "warn"
 
     @staticmethod
-    def log(
+    def record(
         operator_id: Optional[int],
         operator_name: Optional[str],
         action: str,
@@ -40,103 +48,102 @@ class OperationLogger:
         target_type: Optional[str] = None,
         details: Optional[dict] = None,
         ip_address: Optional[str] = None
-    ):
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            details_str = json.dumps(details, ensure_ascii=False) if details else None
-            cursor.execute(
+    ) -> int:
+        details_str = json.dumps(details, ensure_ascii=False) if details else None
+        with db_conn() as conn:
+            c = conn.cursor()
+            c.execute(
                 """INSERT INTO operation_logs
-                   (operator_id, operator_name, action, module, target_id, target_type, details, ip_address)
+                   (operator_id, operator_name, action, module,
+                    target_id, target_type, details, ip_address)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (operator_id, operator_name, action, module, target_id, target_type, details_str, ip_address)
+                (operator_id, operator_name, action, module,
+                 target_id, target_type, details_str, ip_address)
             )
+            log_id = c.lastrowid
+
+        log_file = os.path.join(LOG_DIR, f"oplog_{now_str()[:10]}.log")
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{now_str()}] [{module}.{action}] "
+                    f"operator={operator_name or 'System'}({operator_id}) "
+                    f"target={target_type or '-'}({target_id}) "
+                    f"details={details_str or '-'}\n"
+                )
+        except Exception:
+            pass
+
+        return log_id
 
     @staticmethod
-    def query_logs(
+    def query(
         operator_id: Optional[int] = None,
-        department_id: Optional[int] = None,
+        dept_id: Optional[int] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         module: Optional[str] = None,
         action: Optional[str] = None,
-        limit: int = 100,
+        limit: int = 200,
         offset: int = 0
-    ):
-        with get_db_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
+    ) -> list:
+        with db_conn() as conn:
+            c = conn.cursor()
             sql = """
-                SELECT l.*, e.department_id as operator_department
+                SELECT l.*, e.dept_id AS operator_dept
                 FROM operation_logs l
-                LEFT JOIN employees e ON l.operator_id = e.id
+                LEFT JOIN employees e ON l.operator_id = e.emp_id
                 WHERE 1=1
             """
             params = []
-
             if operator_id is not None:
                 sql += " AND l.operator_id = ?"
                 params.append(operator_id)
-
-            if department_id is not None:
-                sql += " AND e.department_id = ?"
-                params.append(department_id)
-
+            if dept_id is not None:
+                sql += " AND e.dept_id = ?"
+                params.append(dept_id)
             if start_time:
                 sql += " AND l.created_at >= ?"
                 params.append(start_time)
-
             if end_time:
                 sql += " AND l.created_at <= ?"
                 params.append(end_time)
-
             if module:
                 sql += " AND l.module = ?"
                 params.append(module)
-
             if action:
                 sql += " AND l.action = ?"
                 params.append(action)
-
             sql += " ORDER BY l.created_at DESC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
-
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            c.execute(sql, params)
+            return [dict(r) for r in c.fetchall()]
 
     @staticmethod
-    def export_logs_to_csv(
+    def export_csv(
         file_path: str,
         operator_id: Optional[int] = None,
-        department_id: Optional[int] = None,
+        dept_id: Optional[int] = None,
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
         module: Optional[str] = None,
         action: Optional[str] = None
-    ):
-        import csv
-        logs = OperationLogger.query_logs(
+    ) -> int:
+        logs = OperationLogger.query(
             operator_id=operator_id,
-            department_id=department_id,
+            dept_id=dept_id,
             start_time=start_time,
             end_time=end_time,
             module=module,
             action=action,
-            limit=100000,
+            limit=999999,
             offset=0
         )
-
-        fieldnames = [
-            "id", "operator_id", "operator_name", "action", "module",
-            "target_id", "target_type", "details", "ip_address", "created_at"
-        ]
-
+        headers = ["log_id", "operator_id", "operator_name", "module", "action",
+                   "target_id", "target_type", "details", "ip_address", "created_at"]
         with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
+            writer = csv.writer(f)
+            writer.writerow(headers)
             for log in logs:
-                row = {k: log.get(k, "") for k in fieldnames}
-                writer.writerow(row)
-
+                writer.writerow([log.get(h, "") for h in headers])
         return len(logs)
