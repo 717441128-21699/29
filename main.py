@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import OUTPUT_DIR, MATERIAL_CATALOG, now_str
 from database import init_db, db_conn
@@ -328,7 +328,7 @@ def demo8_logger():
     if emp:
         filtered = OperationLogger.query(
             dept_id=emp["dept_id"],
-            start_time=(datetime.now().timestamp() - 86400).__str__(),
+            start_time=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
             limit=10
         )
         print(f"  部门 {emp['dept_name']} 共 {len(filtered)} 条记录")
@@ -352,7 +352,25 @@ DEMOS = [
 ]
 
 
+_AUTO_RUN = False
+
+
+def _pause(msg: str = "\n按回车继续下一个演示..."):
+    global _AUTO_RUN
+    if _AUTO_RUN:
+        print(msg + " [自动模式，继续]")
+        return
+    try:
+        if sys.stdin.isatty():
+            input(msg)
+        else:
+            print(msg + " [非交互模式，自动继续]")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main():
+    global _AUTO_RUN
     hdr(f"{ '智联科技 · 企业级印刷自动化管理系统' }")
     print(f"  数据库: {os.path.abspath('print_system.db')}")
     print(f"  输出目录: {os.path.abspath(OUTPUT_DIR)}")
@@ -361,6 +379,43 @@ def main():
     print("\n[初始化] 正在检查并初始化数据库...")
     init_db()
     print("[初始化] 完成！\n")
+
+    auto_run = None
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg == "--all":
+            auto_run = "all"
+        elif arg.startswith("--demo="):
+            try:
+                auto_run = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif arg.isdigit():
+            auto_run = int(arg)
+
+    if auto_run is not None:
+        _AUTO_RUN = True
+
+    if auto_run == "all":
+        for i, (_, func) in enumerate(DEMOS, 1):
+            try:
+                func()
+            except Exception as e:
+                print(f"\n  ❌ 演示{i}执行出错: {e}")
+                import traceback
+                traceback.print_exc()
+            _pause()
+        print("\n🎉 全部演示完成！")
+        return
+
+    if isinstance(auto_run, int) and 1 <= auto_run <= len(DEMOS):
+        try:
+            DEMOS[auto_run - 1][1]()
+        except Exception as e:
+            print(f"\n  ❌ 执行出错: {e}")
+            import traceback
+            traceback.print_exc()
+        return
 
     while True:
         print()
@@ -392,7 +447,7 @@ def main():
                     print(f"\n  ❌ 演示{i}执行出错: {e}")
                     import traceback
                     traceback.print_exc()
-                input("\n按回车继续下一个演示...")
+                _pause()
             continue
 
         try:

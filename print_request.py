@@ -73,6 +73,8 @@ class MaterialValidator:
 
 
 class TemplateGenerator:
+    L = "=" * 64
+    S = "-" * 64
 
     @staticmethod
     def generate(employee: dict, material_type: str,
@@ -93,8 +95,8 @@ class TemplateGenerator:
     def _build(emp: dict, mtype: str, mname: str,
                info: dict, custom: Optional[dict]) -> str:
         ci = COMPANY_INFO
-        L = "=" * 64
-        S = "-" * 64
+        L = TemplateGenerator.L
+        S = TemplateGenerator.S
         lines = [
             L,
             f"  {ci['name']} - {mname} 标准设计稿模板",
@@ -147,6 +149,7 @@ class TemplateGenerator:
 
     @staticmethod
     def _spec(mtype: str, emp: dict) -> list:
+        S = TemplateGenerator.S
         ci = COMPANY_INFO
         name = emp.get("emp_name", "")
         pos = emp.get("position", "")

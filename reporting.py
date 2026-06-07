@@ -37,6 +37,7 @@ class CostWarningService:
             month
         ]
         warnings = []
+        pending_notifs = []
 
         with db_conn() as conn:
             c = conn.cursor()
@@ -94,11 +95,11 @@ class CostWarningService:
                         if heads:
                             for aid in [heads["supervisor_id"], heads["director_id"]]:
                                 if aid:
-                                    NotificationService.send(
-                                        recipient_id=aid,
-                                        notif_type=NotificationService.TYPE_BUDGET_WARNING,
-                                        title=f"【费用预警】{dept['dept_name']}连续两月费用增长超20%",
-                                        content=(
+                                    pending_notifs.append({
+                                        "recipient_id": aid,
+                                        "notif_type": NotificationService.TYPE_BUDGET_WARNING,
+                                        "title": f"【费用预警】{dept['dept_name']}连续两月费用增长超20%",
+                                        "content": (
                                             f"部门: {dept['dept_name']}\n"
                                             f"{months[0]}: ¥{c0:,.2f}\n"
                                             f"{months[1]}: ¥{c1:,.2f} (环比+{r1*100:.1f}%)\n"
@@ -107,9 +108,12 @@ class CostWarningService:
                                             "节约建议:\n" +
                                             "\n".join(f"  • {s}" for s in sgs)
                                         ),
-                                        related_id=dept["dept_id"],
-                                        related_type="department"
-                                    )
+                                        "related_id": dept["dept_id"],
+                                        "related_type": "department"
+                                    })
+
+        for n in pending_notifs:
+            NotificationService.send(**n)
         return warnings
 
 
@@ -202,7 +206,7 @@ class ReportService:
                 (prev_month,)
             )
             pr = c.fetchone()
-            prev_cost = pr["cost"] if pr else 0.0
+            prev_cost = float(pr["cost"]) if pr and pr["cost"] is not None else 0.0
             if prev_cost > 0:
                 yoy = (total_cost - prev_cost) / prev_cost
             else:

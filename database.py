@@ -12,9 +12,11 @@ from config import (
 
 @contextmanager
 def db_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
         conn.commit()
@@ -322,10 +324,18 @@ def seed_demo_data():
                     (pid, mtype, mr, random.randint(15, 250), random.randint(2, 7))
                 )
 
+        dept_ids = list(dept_map.values())
         for offset in range(4):
             month = current_month_str(offset)
-            for did in dept_map.values():
-                used = round(random.uniform(2500, 9500), 2)
+            for idx, did in enumerate(dept_ids):
+                if idx == 0 and offset <= 2:
+                    base = {2: 3000.0, 1: 4000.0, 0: 5600.0}
+                    used = base.get(offset, round(random.uniform(2500, 9500), 2))
+                elif idx == 1 and offset <= 2:
+                    base = {2: 2500.0, 1: 3200.0, 0: 4500.0}
+                    used = base.get(offset, round(random.uniform(2500, 9500), 2))
+                else:
+                    used = round(random.uniform(2500, 9500), 2)
                 c.execute(
                     """INSERT OR IGNORE INTO department_budgets
                        (dept_id, month, allocated, used)

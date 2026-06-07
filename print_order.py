@@ -97,19 +97,22 @@ class PrintOrderService:
     def create_from_request(req_id: int, operator_id: Optional[int] = None,
                             operator_name: Optional[str] = None,
                             batch_id: Optional[str] = None) -> Dict[str, Any]:
+        req = PrintRequestService.get(req_id)
+        if not req:
+            return {"success": False, "message": "申请不存在"}
+        if req["status"] != "approved":
+            return {"success": False,
+                    "message": f"申请未通过审批，当前状态: {req['status']}"}
+
+        printer = PrinterMatcher.best_match(req["material_type"])
+        if not printer:
+            return {"success": False, "message": "无可用印刷商"}
+
+        order_id = None
+        order_no = None
+        expected = None
         with db_conn() as conn:
             c = conn.cursor()
-            req = PrintRequestService.get(req_id)
-            if not req:
-                return {"success": False, "message": "申请不存在"}
-            if req["status"] != "approved":
-                return {"success": False,
-                        "message": f"申请未通过审批，当前状态: {req['status']}"}
-
-            printer = PrinterMatcher.best_match(req["material_type"])
-            if not printer:
-                return {"success": False, "message": "无可用印刷商"}
-
             delivery_days = printer.get("avg_delivery_days", 3)
             expected = (datetime.now() + timedelta(days=delivery_days)).strftime("%Y-%m-%d")
             order_no = PrintOrderService._new_order_no()
@@ -129,6 +132,9 @@ class PrintOrderService:
                    SET status = 'in_production', updated_at = ? WHERE req_id = ?""",
                 (now_str(), req_id)
             )
+
+        if order_id is None:
+            return {"success": False, "message": "创建订单失败"}
 
         OperationLogger.record(
             operator_id=operator_id,

@@ -145,17 +145,18 @@ class BatchPrintService:
         operator_id: Optional[int] = None,
         operator_name: Optional[str] = None
     ) -> Dict[str, Any]:
+        reqs = {}
+        for rid in req_ids:
+            req = PrintRequestService.get(rid)
+            if req and req["status"] == "approved":
+                reqs[rid] = req
+
+        from_stock = []
+        need_print = []
         with db_conn() as conn:
             c = conn.cursor()
 
-            from_stock = []
-            need_print = []
-
-            for rid in req_ids:
-                req = PrintRequestService.get(rid)
-                if not req or req["status"] != "approved":
-                    continue
-
+            for rid, req in reqs.items():
                 mtype = req["material_type"]
                 dept_id = req["dept_id"]
                 remaining = req["quantity"]
@@ -200,6 +201,8 @@ class BatchPrintService:
                                SET quantity = ?, total_amount = ? WHERE req_id = ?""",
                             (remaining, round(remaining * up, 2), rid)
                         )
+                        reqs[rid]["quantity"] = remaining
+                        reqs[rid]["total_amount"] = round(remaining * up, 2)
                     need_print.append(rid)
 
         order_result = {"success": True, "batch_id": None, "results": []}

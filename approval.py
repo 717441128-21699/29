@@ -126,16 +126,20 @@ class ApprovalService:
     @staticmethod
     def process(req_id: int, operator_id: Optional[int] = None,
                 operator_name: Optional[str] = None) -> Dict[str, Any]:
+        result = {"success": False, "message": ""}
+        log_params = None
         with db_conn() as conn:
             c = conn.cursor()
             c.execute("SELECT * FROM print_requests WHERE req_id = ?", (req_id,))
             row = c.fetchone()
             if not row:
-                return {"success": False, "message": "申请不存在"}
+                result["message"] = "申请不存在"
+                return result
             req = dict(row)
 
             if req["status"] != "pending_validate":
-                return {"success": False, "message": f"申请状态异常: {req['status']}"}
+                result["message"] = f"申请状态异常: {req['status']}"
+                return result
 
             amount = req["total_amount"]
             dept_id = req["dept_id"]
@@ -152,84 +156,84 @@ class ApprovalService:
                            updated_at = ? WHERE req_id = ?""",
                     (reason, now_str(), req_id)
                 )
-                OperationLogger.record(
-                    operator_id=operator_id,
-                    operator_name=operator_name or "系统",
-                    action=LogAction.REJECT,
-                    module=LogModule.BUDGET,
-                    target_id=req_id,
-                    target_type="print_request",
-                    details={"reason": "预算不足", **check}
-                )
-                return {"success": False, "message": reason, "status": "rejected",
-                        "budget": check}
+                log_params = (operator_id, operator_name or "系统", LogAction.REJECT,
+                              LogModule.BUDGET, req_id, "print_request",
+                              {"reason": "预算不足", **check})
+                result.update({"success": False, "message": reason,
+                               "status": "rejected", "budget": check})
+                conn.commit()
 
-            level = ApprovalService.required_level(amount)
+            if "status" not in result:
+                level = ApprovalService.required_level(amount)
 
-            if level == ApprovalService.LEVEL_NONE:
-                BudgetService.consume(dept_id, amount)
-                c.execute(
-                    """UPDATE print_requests
-                       SET status = 'approved', updated_at = ? WHERE req_id = ?""",
-                    (now_str(), req_id)
-                )
-                OperationLogger.record(
-                    operator_id=operator_id,
-                    operator_name=operator_name or "系统",
-                    action=LogAction.APPROVE,
-                    module=LogModule.APPROVAL,
-                    target_id=req_id,
-                    target_type="print_request",
-                    details={"level": "auto", "amount": amount}
-                )
-                return {"success": True, "message": "预算充足，金额低于审批阈值，自动通过",
-                        "budget": check, "approval_level": level, "status": "approved"}
+                if level == ApprovalService.LEVEL_NONE:
+                    BudgetService.consume(dept_id, amount)
+                    c.execute(
+                        """UPDATE print_requests
+                           SET status = 'approved', updated_at = ? WHERE req_id = ?""",
+                        (now_str(), req_id)
+                    )
+                    log_params = (operator_id, operator_name or "系统",
+                                  LogAction.APPROVE, LogModule.APPROVAL,
+                                  req_id, "print_request",
+                                  {"level": "auto", "amount": amount})
+                    result.update({
+                        "success": True,
+                        "message": "预算充足，金额低于审批阈值，自动通过",
+                        "budget": check, "approval_level": level,
+                        "status": "approved"
+                    })
+                else:
+                    approver_id = ApprovalService.get_approver_id(dept_id, level)
+                    c.execute(
+                        """UPDATE print_requests
+                           SET status = 'pending_approval', updated_at = ? WHERE req_id = ?""",
+                        (now_str(), req_id)
+                    )
+                    c.execute(
+                        """INSERT INTO approvals
+                           (req_id, approval_level, approver_id, status)
+                           VALUES (?, ?, ?, 'pending')""",
+                        (req_id, level, approver_id)
+                    )
+                    level_name = "主管" if level == ApprovalService.LEVEL_SUPERVISOR else "总监"
+                    log_params = (operator_id, operator_name or "系统",
+                                  LogAction.VALIDATE, LogModule.APPROVAL,
+                                  req_id, "print_request",
+                                  {"level": level, "level_name": level_name,
+                                   "approver_id": approver_id, "amount": amount})
+                    threshold = (APPROVAL_SUPERVISOR_THRESHOLD
+                                 if level == ApprovalService.LEVEL_SUPERVISOR
+                                 else APPROVAL_DIRECTOR_THRESHOLD)
+                    result.update({
+                        "success": True,
+                        "message": f"预算充足，需{level_name}审批 (≥{threshold:.0f}元)",
+                        "budget": check,
+                        "approval_level": level,
+                        "approver_id": approver_id,
+                        "status": "pending_approval"
+                    })
 
-            approver_id = ApprovalService.get_approver_id(dept_id, level)
-            c.execute(
-                """UPDATE print_requests
-                   SET status = 'pending_approval', updated_at = ? WHERE req_id = ?""",
-                (now_str(), req_id)
-            )
-            c.execute(
-                """INSERT INTO approvals
-                   (req_id, approval_level, approver_id, status)
-                   VALUES (?, ?, ?, 'pending')""",
-                (req_id, level, approver_id)
-            )
-
-            level_name = "主管" if level == ApprovalService.LEVEL_SUPERVISOR else "总监"
-            OperationLogger.record(
-                operator_id=operator_id,
-                operator_name=operator_name or "系统",
-                action=LogAction.VALIDATE,
-                module=LogModule.APPROVAL,
-                target_id=req_id,
-                target_type="print_request",
-                details={"level": level, "level_name": level_name,
-                         "approver_id": approver_id, "amount": amount}
-            )
-            return {
-                "success": True,
-                "message": f"预算充足，需{level_name}审批 (≥{APPROVAL_SUPERVISOR_THRESHOLD if level == ApprovalService.LEVEL_SUPERVISOR else APPROVAL_DIRECTOR_THRESHOLD:.0f}元)",
-                "budget": check,
-                "approval_level": level,
-                "approver_id": approver_id,
-                "status": "pending_approval"
-            }
+        if log_params:
+            OperationLogger.record(*log_params)
+        return result
 
     @staticmethod
     def approve(req_id: int, approver_id: int, comments: Optional[str] = None,
                 operator_name: Optional[str] = None) -> Dict[str, Any]:
+        result = {"success": False, "message": ""}
+        log_params = None
         with db_conn() as conn:
             c = conn.cursor()
             c.execute("SELECT * FROM print_requests WHERE req_id = ?", (req_id,))
             row = c.fetchone()
             if not row:
-                return {"success": False, "message": "申请不存在"}
+                result["message"] = "申请不存在"
+                return result
             req = dict(row)
             if req["status"] != "pending_approval":
-                return {"success": False, "message": f"当前状态无需审批: {req['status']}"}
+                result["message"] = f"当前状态无需审批: {req['status']}"
+                return result
 
             c.execute(
                 """SELECT * FROM approvals
@@ -238,9 +242,11 @@ class ApprovalService:
             )
             ap = c.fetchone()
             if not ap:
-                return {"success": False, "message": "无待审批记录"}
+                result["message"] = "无待审批记录"
+                return result
             if ap["approver_id"] and ap["approver_id"] != approver_id:
-                return {"success": False, "message": "您不是该申请的审批人"}
+                result["message"] = "您不是该申请的审批人"
+                return result
 
             BudgetService.consume(req["dept_id"], req["total_amount"])
 
@@ -255,29 +261,31 @@ class ApprovalService:
                    SET status = 'approved', updated_at = ? WHERE req_id = ?""",
                 (now_str(), req_id)
             )
-            OperationLogger.record(
-                operator_id=approver_id,
-                operator_name=operator_name,
-                action=LogAction.APPROVE,
-                module=LogModule.APPROVAL,
-                target_id=req_id,
-                target_type="print_request",
-                details={"comments": comments, "amount": req["total_amount"]}
-            )
-            return {"success": True, "message": "审批通过"}
+            log_params = (approver_id, operator_name, LogAction.APPROVE,
+                          LogModule.APPROVAL, req_id, "print_request",
+                          {"comments": comments, "amount": req["total_amount"]})
+            result.update({"success": True, "message": "审批通过"})
+
+        if log_params:
+            OperationLogger.record(*log_params)
+        return result
 
     @staticmethod
     def reject(req_id: int, approver_id: int, reason: str,
                operator_name: Optional[str] = None) -> Dict[str, Any]:
+        result = {"success": False, "message": ""}
+        log_params = None
         with db_conn() as conn:
             c = conn.cursor()
             c.execute("SELECT * FROM print_requests WHERE req_id = ?", (req_id,))
             row = c.fetchone()
             if not row:
-                return {"success": False, "message": "申请不存在"}
+                result["message"] = "申请不存在"
+                return result
             req = dict(row)
             if req["status"] != "pending_approval":
-                return {"success": False, "message": f"当前状态无法拒绝: {req['status']}"}
+                result["message"] = f"当前状态无法拒绝: {req['status']}"
+                return result
 
             c.execute(
                 """SELECT * FROM approvals
@@ -286,9 +294,11 @@ class ApprovalService:
             )
             ap = c.fetchone()
             if not ap:
-                return {"success": False, "message": "无待审批记录"}
+                result["message"] = "无待审批记录"
+                return result
             if ap["approver_id"] and ap["approver_id"] != approver_id:
-                return {"success": False, "message": "您不是该申请的审批人"}
+                result["message"] = "您不是该申请的审批人"
+                return result
 
             c.execute(
                 """UPDATE approvals
@@ -302,16 +312,15 @@ class ApprovalService:
                    WHERE req_id = ?""",
                 (reason, now_str(), req_id)
             )
-            OperationLogger.record(
-                operator_id=approver_id,
-                operator_name=operator_name,
-                action=LogAction.REJECT,
-                module=LogModule.APPROVAL,
-                target_id=req_id,
-                target_type="print_request",
-                details={"reason": reason}
-            )
-            return {"success": True, "message": "已拒绝申请"}
+            BudgetService.release(req["dept_id"], req["total_amount"])
+            log_params = (approver_id, operator_name, LogAction.REJECT,
+                          LogModule.APPROVAL, req_id, "print_request",
+                          {"reason": reason})
+            result.update({"success": True, "message": "已拒绝申请"})
+
+        if log_params:
+            OperationLogger.record(*log_params)
+        return result
 
     @staticmethod
     def pending(approver_id: Optional[int] = None,

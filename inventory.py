@@ -90,6 +90,8 @@ class InventoryService:
         order = PrintOrderService.get(order_id)
         if not order:
             return None
+        inv_id = None
+        notif_params = None
         with db_conn() as conn:
             c = conn.cursor()
             c.execute(
@@ -106,19 +108,19 @@ class InventoryService:
             unit = mat_info.get("unit", "")
 
             if order["emp_id"]:
-                NotificationService.send(
-                    recipient_id=order["emp_id"],
-                    notif_type=NotificationService.TYPE_PICKUP_READY,
-                    title=f"您的{mat_name}已印制完成，请到行政部领取",
-                    content=(
+                notif_params = {
+                    "recipient_id": order["emp_id"],
+                    "notif_type": NotificationService.TYPE_PICKUP_READY,
+                    "title": f"您的{mat_name}已印制完成，请到行政部领取",
+                    "content": (
                         f"订单号: {order['order_no']}\n"
                         f"物料: {mat_name}\n"
                         f"数量: {order['quantity']}{unit}\n"
                         f"请在 {PICKUP_REMINDER_DAYS} 天内领取，逾期将发送催领通知。"
                     ),
-                    related_id=inv_id,
-                    related_type="inventory"
-                )
+                    "related_id": inv_id,
+                    "related_type": "inventory"
+                }
 
             c.execute(
                 """UPDATE print_orders
@@ -132,20 +134,24 @@ class InventoryService:
                     (now_str(), order["req_id"])
                 )
 
-        OperationLogger.record(
-            operator_id=operator_id,
-            operator_name="系统",
-            action=LogAction.CREATE,
-            module=LogModule.INVENTORY,
-            target_id=inv_id,
-            target_type="inventory",
-            details={
-                "order_id": order_id,
-                "material_type": order["material_type"],
-                "quantity": order["quantity"],
-                "emp_id": order["emp_id"]
-            }
-        )
+        if notif_params:
+            NotificationService.send(**notif_params)
+
+        if inv_id:
+            OperationLogger.record(
+                operator_id=operator_id,
+                operator_name="系统",
+                action=LogAction.CREATE,
+                module=LogModule.INVENTORY,
+                target_id=inv_id,
+                target_type="inventory",
+                details={
+                    "order_id": order_id,
+                    "material_type": order["material_type"],
+                    "quantity": order["quantity"],
+                    "emp_id": order["emp_id"]
+                }
+            )
         return inv_id
 
     @staticmethod
@@ -191,6 +197,9 @@ class InventoryService:
     def run_reminder_cron() -> Dict[str, Any]:
         cutoff = (datetime.now() - timedelta(days=PICKUP_REMINDER_DAYS))
         cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        pending_notifs = []
+        pending_logs = []
+        overdue = []
         with db_conn() as conn:
             c = conn.cursor()
             c.execute(
@@ -214,36 +223,43 @@ class InventoryService:
                     "name_cn", inv["material_type"])
                 unit = MATERIAL_CATALOG.get(inv["material_type"], {}).get("unit", "")
                 if inv["emp_id"]:
-                    NotificationService.send(
-                        recipient_id=inv["emp_id"],
-                        notif_type=NotificationService.TYPE_PICKUP_REMINDER,
-                        title=f"【催领通知】您的{mat_name}已超过{PICKUP_REMINDER_DAYS}天未领取",
-                        content=(
+                    pending_notifs.append({
+                        "recipient_id": inv["emp_id"],
+                        "notif_type": NotificationService.TYPE_PICKUP_REMINDER,
+                        "title": f"【催领通知】您的{mat_name}已超过{PICKUP_REMINDER_DAYS}天未领取",
+                        "content": (
                             f"物料类型: {mat_name}\n"
                             f"数量: {inv['quantity']}{unit}\n"
                             f"请尽快到行政部领取，超过7天未领取将作回收处理。"
                         ),
-                        related_id=inv["inv_id"],
-                        related_type="inventory"
-                    )
+                        "related_id": inv["inv_id"],
+                        "related_type": "inventory"
+                    })
                 reminded += 1
-
-                OperationLogger.record(
-                    operator_id=None,
-                    operator_name="系统",
-                    action=LogAction.REMIND,
-                    module=LogModule.INVENTORY,
-                    target_id=inv["inv_id"],
-                    target_type="inventory",
-                    details={
+                pending_logs.append({
+                    "target_id": inv["inv_id"],
+                    "details": {
                         "emp_id": inv["emp_id"],
                         "emp_name": inv.get("emp_name"),
                         "material_type": inv["material_type"],
                         "quantity": inv["quantity"],
                         "days_overdue": PICKUP_REMINDER_DAYS
                     }
-                )
-        return {"total_overdue": len(overdue), "reminded": reminded}
+                })
+
+        for n in pending_notifs:
+            NotificationService.send(**n)
+        for lg in pending_logs:
+            OperationLogger.record(
+                operator_id=None,
+                operator_name="系统",
+                action=LogAction.REMIND,
+                module=LogModule.INVENTORY,
+                target_id=lg["target_id"],
+                target_type="inventory",
+                details=lg["details"]
+            )
+        return {"total_overdue": len(overdue), "reminded": len(pending_logs)}
 
     @staticmethod
     def list(status: Optional[str] = None, emp_id: Optional[int] = None,
